@@ -1,0 +1,2 @@
+# Preserve byte-for-byte source snapshots and existing SHA-256 manifests.
+* -text
