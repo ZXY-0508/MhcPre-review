@@ -1,4 +1,13 @@
-# MhcPre 当前项目审阅快照（2026-09-09）
+# MhcPre 边界修复审阅入口（2026-09-10）
+
+本分支修复预处理尾块预取越界，以及短 headDim 下共享 scratch 容量不足。
+审阅内容、离线验证范围和版本记录流程见 [PREPROCESS_BOUNDS_REVIEW.md](docs/PREPROCESS_BOUNDS_REVIEW.md)。
+
+当前 code/ 已有修改；下面的哈希、打包状态和测试报告属于 2026-09-09 的历史快照。
+S1_submission.zip、s1_package/ 与旧 SHA256_MANIFEST.txt 不代表本分支源码。
+本次未进行 CANN 编译或 NPU 评测，A/C/B/D 性能实验尚未启用。
+
+## 历史快照（2026-09-09）
 
 本快照用于交给其他开发者分析优化方案，不是新优化版本，也不是本次已验证的比赛提交。
 

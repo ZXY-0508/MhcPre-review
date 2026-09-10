@@ -1,5 +1,10 @@
 # MhcPre_group_vec_v1
 
+> 当前修复分支请先读 [审阅入口](REVIEW_START_HERE.md) 和
+> [边界修复与版本绑定说明](docs/PREPROCESS_BOUNDS_REVIEW.md)。
+> 下文保留旧版本说明，其中 tile=1024、槽位布局和 UB 数字已过时。
+> 当前 host tile=512、hIn tile=256；本分支尚无 CANN/NPU 验证结果。
+
 组级向量后处理候选（batch_v1 的直通继承者）。在保持官方单轮 8/9 协议、
 浮点顺序与 host M64 tiling 完全不变的前提下，把 AIV 后处理从“逐行标量 +
 逐 stream 循环”改成“组(8 行)级聚合 DMA + Brcb 批量归约”。

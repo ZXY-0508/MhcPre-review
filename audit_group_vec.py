@@ -5,9 +5,9 @@ Self-contained (stdlib only; no numpy).  Checks:
 - the host tiling partition (48 AIV / 24 AIC, rowsPerVector = 2*vectorRowsPerCore,
   ceil-divided rows without alignment; runtime single-shape M may be < 16),
   with M64 fixed matmul tiling;
-- the complete operator formula with bit-accurate fp32/fp16/bf16 helpers,
-  replicating the group_vec PostprocessRows data flow (group hMix load,
-  per-row Brcb hIn over n streams, per-row hPre/hPost/hRes);
+- a CPU formula sanity model with explicit fp32/fp16/bf16 rounding helpers;
+  this does not execute C++ or prove device ReduceSum/Exp/matmul equivalence;
+- source-bound preprocessing tail loads and shared scratch capacity;
 - the AIV UB budget (queue depths all <= 2) and 64-bit workspace layout;
 - the group_vec red lines over the actual submitted files.
 
@@ -87,7 +87,8 @@ def partition(batch_seq: int) -> tuple[int, list[tuple[int, int]], list[tuple[in
 
 
 def check_partitions() -> None:
-    legal_bs = sorted({b * s for b in LEGAL_B for s in LEGAL_S})
+    legal_bs = sorted({b * s for b in LEGAL_B for s in LEGAL_S} |
+                      set(range(130)) | {431, 432, 433})
     max_cube_rows = 0
     for batch_seq in legal_bs:
         cube_rows, vector_ranges, cube_ranges = partition(batch_seq)
@@ -288,9 +289,7 @@ def run_formula_case(n: int, d: int, has_gamma: bool, dtype: str, rows: int, see
                         for kk in range(flat)])
 
     h_mix = fp32_matmul(x_gamma, phi, flat)
-    for r in range(rows):
-        for j in range(mix):
-            h_mix[r][j] = f32(h_mix[r][j] * inv_rms[r])
+    # The current kernel folds invRms * alpha before scaling hMix.
 
     h_pre = []
     h_post = []
@@ -298,25 +297,26 @@ def run_formula_case(n: int, d: int, has_gamma: bool, dtype: str, rows: int, see
     for r in range(rows):
         pre = []
         post = []
+        scales = [f32(inv_rms[r] * a) for a in alpha]
         for j in range(n):
             w_pre = h_mix[r][j]
-            pre.append(f32(sigmoid(f32(f32(w_pre * alpha[0]) + bias[j])) + hc_eps))
+            pre.append(f32(sigmoid(f32(f32(w_pre * scales[0]) + bias[j])) + hc_eps))
             w_post = h_mix[r][n + j]
-            post.append(f32(2.0 * sigmoid(f32(f32(w_post * alpha[1]) + bias[n + j]))))
+            post.append(f32(2.0 * sigmoid(f32(f32(w_post * scales[1]) + bias[n + j]))))
         h_pre.append(pre)
         h_post.append(post)
         res = []
         for j in range(n * n):
             w_res = h_mix[r][2 * n + j]
-            res.append(f32(f32(w_res * alpha[2]) + bias[2 * n + j]))
+            res.append(f32(f32(w_res * scales[2]) + bias[2 * n + j]))
         h_res.append(res)
 
     h_in = []
     for r in range(rows):
         row = []
         for dd in range(d):
-            acc = 0.0
-            for s in range(n):
+            acc = f32(h_pre[r][0] * x[r][dd])
+            for s in range(1, n):
                 acc = f32(acc + f32(h_pre[r][s] * x[r][s * d + dd]))
             # CAST_RINT: fp32 -> fp16/bf16 直接舍入到目标格式网格(round-half-even),
             # 不是先取整数再转格式 —— 例如 0.25 应保留为 0.25。
@@ -342,7 +342,7 @@ def check_formula() -> None:
             run_formula_case(n, 32, False, dtype, rows=36, seed=seed)
             seed += 1
     run_formula_case(8, 1024, True, "fp16", rows=8, seed=seed)
-    print("  formula audit OK (fp16/bf16, gamma on/off, N=24/48/80)")
+    print("  CPU formula sanity OK (not a device bit-exact comparison)")
 
 
 # ---------------------------------------------------------------------------
@@ -350,28 +350,29 @@ def check_formula() -> None:
 # ---------------------------------------------------------------------------
 
 
+def ub_bytes_for(n: int, d: int, vector_rows: int, has_gamma: bool) -> int:
+    h_in_tile = min(K_HIN_TILE, d)
+    scratch = max(TILE_ELEMENTS, K_HIN_BLOCK_ROWS * h_in_tile)
+    # Round each allocation to 32B, including the unaligned rowSum allocation.
+    allocations = (
+        [K_PRE_BLOCK_ROWS * TILE_ELEMENTS * 2] * 2
+        + [K_PRE_BLOCK_ROWS * TILE_ELEMENTS * 4] * 2
+        + [K_HIN_BLOCK_ROWS * h_in_tile * 2] * 2
+        + [K_HIN_BLOCK_ROWS * n * h_in_tile * 2] * 2
+        + [scratch * 4, scratch * 4, 32 * 4, vector_rows * 4]
+        + ([TILE_ELEMENTS * 4] if has_gamma else [])
+        + [64 * 8 * 4, K_HIN_BLOCK_ROWS * n * h_in_tile * 4, 16 * 8 * 4,
+           2 * POST_ARRAY_ELEMS * 4, 2 * POST_ARRAY_ELEMS * 4,
+           2 * RES_ARRAY_MAX * 4, 272 * 4]
+    )
+    return sum(align_up(size, 32) for size in allocations)
+
+
 def check_memory() -> None:
     vector_rows = vector_rows_for(MAX_BATCH_SEQ)
-    n = 8
-    h_in_tile = min(K_HIN_TILE, 16384)
-    ub_bytes = (
-        2 * K_PRE_BLOCK_ROWS * TILE_ELEMENTS * 2          # xQueue
-        + 2 * K_PRE_BLOCK_ROWS * TILE_ELEMENTS * 4        # xCastQueue
-        + 2 * K_HIN_BLOCK_ROWS * h_in_tile * 2            # hInOutQueue
-        + 2 * K_HIN_BLOCK_ROWS * n * h_in_tile * 2        # hInXQueue
-        + K_HIN_BLOCK_ROWS * h_in_tile * 4                # calcBuf
-        + K_HIN_BLOCK_ROWS * h_in_tile * 4                # reduceWorkBuf
-        + 32 * 4                                          # scalarBuf
-        + vector_rows * 4                                 # rowSumBuf
-        + TILE_ELEMENTS * 4                               # gammaBuf
-        + 64 * 8 * 4                                      # batchSumBuf
-        + K_HIN_BLOCK_ROWS * n * h_in_tile * 4            # hInXCastBuf
-        + 16 * 8 * 4                                      # brcbBuf
-        + 2 * POST_ARRAY_ELEMS * 4                        # preArrBuf
-        + 2 * POST_ARRAY_ELEMS * 4                        # postArrBuf
-        + 2 * RES_ARRAY_MAX * 4                           # resArrBuf
-        + 272 * 4                                         # biasBuf (80+64+64+64 layout for n=8 max)
-    )
+    ub_bytes = max(ub_bytes_for(n, d, vector_rows, True)
+                   for n in LEGAL_N
+                   for d in range(LEGAL_D_STEP, LEGAL_D_MAX + 1, LEGAL_D_STEP))
     check(ub_bytes < 192 * 1024, "AIV UB exceeds 192 KiB")
     # Every TQue depth must be <= 2 (same-TPosition sync-event resource cap).
     queue_depths = re.findall(r"TQue<[^>]*,\s*(\d+|kQueueDepth)\s*>", KERNEL_TEXT)
@@ -465,6 +466,128 @@ def check_stride_addresses(kernel: str) -> None:
     print("  stride addresses OK (split arrays, 32B aligned & in bounds)")
 
 
+def check_source_model(kernel: str, host: str) -> None:
+    """Fail closed when the C++ allocation/schedule no longer matches this model."""
+    constants = {
+        "kQueueDepth": 2, "kPostGroupRows": K_POST_GROUP_ROWS,
+        "kPreBlockRows": K_PRE_BLOCK_ROWS, "kHinBlockRows": K_HIN_BLOCK_ROWS,
+        "kHinTileElements": K_HIN_TILE, "kSumBatchRows": 64,
+        "kFloatBlockElements": 8, "kSlotPreStride": 8,
+        "kSlotPostStride": 8, "kBlkSize": 32, "kTimingProbeIters": 0,
+    }
+    for source, expected in ((kernel, constants),
+                             (host, {"kVectorTileElements": TILE_ELEMENTS})):
+        for name, value in expected.items():
+            found = re.findall(r"constexpr\s+(?:u?int\d+_t)\s+" + name +
+                               r"\s*=\s*(\d+)[uUlL]*\s*;", source)
+            check(found == [str(value)], f"source/model constant mismatch: {name}")
+    compact = re.sub(r"\s+", "", kernel)
+    for statement in (
+        "kPostArrayElems=kPostGroupRows*kSlotPreStride;",
+        "kResArrayMax=kPostGroupRows*64;",
+        "const uint32_t tileElements = tiling_->tileElements;",
+        "hInTile_=static_cast<uint32_t>(MinU64(static_cast<uint64_t>(kHinTileElements),tiling_->headDim));",
+        "const uint32_t hInScratchElements = kHinBlockRows * hInTile_;",
+        "const uint32_t scratchElements = tileElements > hInScratchElements ? tileElements : hInScratchElements;",
+    ):
+        check(re.sub(r"\s+", "", statement) in compact,
+              "source/model expression mismatch: " + statement)
+    check("tiling->tileElements=static_cast<uint32_t>(kVectorTileElements);" in
+          re.sub(r"\s+", "", host), "host tile assignment changed")
+    allocations = [
+        "xQueue_,kQueueDepth,kPreBlockRows*tileElements*sizeof(DT_X)",
+        "xCastQueue_,kQueueDepth,kPreBlockRows*tileElements*sizeof(float)",
+        "hInOutQueue_,kQueueDepth,kHinBlockRows*hInTile_*sizeof(DT_X)",
+        "hInXQueue_,kQueueDepth,kHinBlockRows*n*hInTile_*sizeof(DT_X)",
+        "calcBuf_,scratchElements*sizeof(float)",
+        "reduceWorkBuf_,scratchElements*sizeof(float)",
+        "scalarBuf_,32*sizeof(float)",
+        "rowSumBuf_,static_cast<uint32_t>(tiling_->vectorRowsPerCore*sizeof(float))",
+        "gammaBuf_,tileElements*sizeof(float)",
+        "batchSumBuf_,kSumBatchRows*kFloatBlockElements*sizeof(float)",
+        "hInXCastBuf_,kHinBlockRows*n*hInTile_*sizeof(float)",
+        "brcbBuf_,16*(kBlkSize/sizeof(float))*sizeof(float)",
+        "preArrBuf_,2*kPostArrayElems*sizeof(float)",
+        "postArrBuf_,2*kPostArrayElems*sizeof(float)",
+        "resArrBuf_,2*kResArrayMax*sizeof(float)",
+        "biasBuf_,272*sizeof(float)",
+    ]
+    actual = re.findall(r"pipe_->InitBuffer\((.*?)\);", compact)
+    check(actual == allocations, "InitBuffer layout differs from UB model")
+    prefetch = """
+        if (blockOffset + kPreBlockRows < rowCount) {
+            LocalTensor<DT_X> nextX = xQueue_.AllocTensor<DT_X>();
+            const uint32_t nextRows = static_cast<uint32_t>(
+                MinU64(kPreBlockRows, rowCount - blockOffset - blockRows));
+            xParams.blockCount = static_cast<uint16_t>(nextRows);
+            DataCopyPad(nextX,
+                xGm_[(firstRow + blockRows) * tiling_->flatDim + flatOffset],
+                xParams, padNone);
+            xQueue_.EnQue(nextX);
+        }
+    """
+    check(re.sub(r"\s+", "", prefetch) in compact,
+          "tail prefetch must be guarded and clamped to the remaining rows")
+    for statement in (
+        "xParams.blockCount=static_cast<uint16_t>(MinU64(kPreBlockRows,rowCount));",
+        "DataCopyPad(xLocal,xGm_[rowStart*tiling_->flatDim+flatOffset],xParams,padNone);",
+        "const uint32_t blockRows=static_cast<uint32_t>(MinU64(kPreBlockRows,rowCount-blockOffset));",
+        "const uint64_t firstRow=rowStart+blockOffset;",
+        "blockOffset+=kPreBlockRows",
+        "Cast(xCastLocal,xLocal,RoundMode::CAST_NONE,blockRows*current);",
+    ):
+        check(re.sub(r"\s+", "", statement) in compact,
+              "preprocess schedule changed: " + statement)
+
+
+def preprocess_loads(start: int, count: int, clamp: bool = True):
+    if count == 0:
+        return []
+    loads = [(start, min(K_PRE_BLOCK_ROWS, count))]
+    for offset in range(0, count, K_PRE_BLOCK_ROWS):
+        rows = min(K_PRE_BLOCK_ROWS, count - offset)
+        if offset + K_PRE_BLOCK_ROWS < count:
+            next_rows = min(K_PRE_BLOCK_ROWS, count - offset - rows) if clamp else K_PRE_BLOCK_ROWS
+            loads.append((start + offset + rows, next_rows))
+    return loads
+
+
+def check_preprocess_bounds() -> None:
+    ranges = {(start, count) for start in (0, 17, 4096) for count in range(130)}
+    for total in list(range(130)) + [431, 432, 433, 4096, 8192, MAX_BATCH_SEQ]:
+        ranges.update(partition(total)[1])
+    for start, count in ranges:
+        loads = preprocess_loads(start, count)
+        consumers = [(start + i, min(K_PRE_BLOCK_ROWS, count - i))
+                     for i in range(0, count, K_PRE_BLOCK_ROWS)]
+        check(loads == consumers, f"prefetch/consumer mismatch: {start}, {count}")
+        check(all(start <= pos < pos + rows <= start + count for pos, rows in loads),
+              f"prefetch escapes AIV partition: {start}, {count}")
+        check(sum(rows for _, rows in loads) == count, "preprocess row coverage mismatch")
+    old_tail = preprocess_loads(0, 9, clamp=False)
+    check(any(pos + rows > 9 for pos, rows in old_tail), "old prefetch regression is not detected")
+
+    row_counts = (0, 1, 63, 64, 65, 127, 128, 129, 511, 512, 513, 1025)
+    for n in LEGAL_N:
+        for d in range(LEGAL_D_STEP, LEGAL_D_MAX + 1, LEGAL_D_STEP):
+            h_in = min(K_HIN_TILE, d)
+            scratch = max(TILE_ELEMENTS, K_HIN_BLOCK_ROWS * h_in)
+            for offset in range(0, n * d, TILE_ELEMENTS):
+                current = min(TILE_ELEMENTS, n * d - offset)
+                check(current <= scratch, f"preprocess scratch overflow: n={n}, D={d}")
+                check(current * 2 % 32 == 0, "preprocess DMA row is not 32B aligned")
+            for count in row_counts:
+                for offset in range(0, count, TILE_ELEMENTS):
+                    check(min(TILE_ELEMENTS, count - offset) <= scratch,
+                          "invRms scratch overflow")
+            for offset in range(0, d, h_in):
+                current = min(h_in, d - offset)
+                check(K_HIN_BLOCK_ROWS * current <= scratch, "hIn scratch overflow")
+    check(6 * 16 > K_HIN_BLOCK_ROWS * 16, "old D=16 preprocess overflow not reproduced")
+    check(65 > K_HIN_BLOCK_ROWS * 16, "old D=16 invRms overflow not reproduced")
+    print(f"  preprocess bounds OK ({len(ranges)} row ranges; full n/D scratch sweep)")
+
+
 def check_redlines(code_dir: Path) -> None:
     global KERNEL_TEXT
     kernel = load_text(code_dir, KERNEL)
@@ -472,6 +595,7 @@ def check_redlines(code_dir: Path) -> None:
     host = load_text(code_dir, HOST)
     tiling = load_text(code_dir, TILING_H)
     key = load_text(code_dir, TILING_KEY)
+    check_source_model(kernel, host)
 
     check(contains(kernel, '#include "lib/matmul_intf.h"'),
           "lib/matmul_intf.h include missing")
@@ -602,9 +726,10 @@ def main() -> None:
     _self_test_arith()
     check_partitions()
     check_shapes()
-    check_formula()
     check_redlines(code)
+    check_preprocess_bounds()
     check_memory()
+    check_formula()
     print("MhcPre group_vec offline audit: PASS")
 
 

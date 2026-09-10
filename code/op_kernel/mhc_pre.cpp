@@ -342,8 +342,12 @@ private:
         pipe_->InitBuffer(hInOutQueue_, kQueueDepth, kHinBlockRows * hInTile_ * sizeof(DT_X));
         pipe_->InitBuffer(hInXQueue_, kQueueDepth,
                           kHinBlockRows * n * hInTile_ * sizeof(DT_X));
-        pipe_->InitBuffer(calcBuf_, kHinBlockRows * hInTile_ * sizeof(float));
-        pipe_->InitBuffer(reduceWorkBuf_, kHinBlockRows * hInTile_ * sizeof(float));
+        // Shared by preprocessing, invRms conversion, and hIn reduction.
+        const uint32_t hInScratchElements = kHinBlockRows * hInTile_;
+        const uint32_t scratchElements =
+            tileElements > hInScratchElements ? tileElements : hInScratchElements;
+        pipe_->InitBuffer(calcBuf_, scratchElements * sizeof(float));
+        pipe_->InitBuffer(reduceWorkBuf_, scratchElements * sizeof(float));
         pipe_->InitBuffer(scalarBuf_, 32 * sizeof(float));
         // 按 AIV 自己的行切分开归约缓冲。
         pipe_->InitBuffer(rowSumBuf_,
@@ -442,7 +446,9 @@ private:
 
                 if (blockOffset + kPreBlockRows < rowCount) {
                     LocalTensor<DT_X> nextX = xQueue_.AllocTensor<DT_X>();
-                    xParams.blockCount = kPreBlockRows;
+                    const uint32_t nextRows = static_cast<uint32_t>(
+                        MinU64(kPreBlockRows, rowCount - blockOffset - blockRows));
+                    xParams.blockCount = static_cast<uint16_t>(nextRows);
                     DataCopyPad(nextX,
                                 xGm_[(firstRow + blockRows) * tiling_->flatDim + flatOffset],
                                 xParams, padNone);
@@ -835,8 +841,8 @@ private:
             SyncMte3ToVector();
         }
         // --- TIMING PROBE: predictable dead work, see kTimingProbeIters ---
-        // Dead compute over calcBuf_ (exactly kHinBlockRows*hInTile_ floats,
-        // its full allocation) after all outputs are written and drained.
+        // Dead compute over the hIn scratch extent within calcBuf_ after
+        // all outputs are written and drained.
         // Plain `if`: host build is C++11, and the body must stay valid even
         // when the constant is 0 (ccec forbids float<->unsigned casts anyway).
         if (kTimingProbeIters != 0) {
