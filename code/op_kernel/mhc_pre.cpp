@@ -1,5 +1,5 @@
-// Architecture experiment v104, common baseline v100.
-// v100: v96 coefficients, paired dQ consumers, no added global barrier.
+// Owner A+B: publish each row's dI/loss once, then read owned R slices.
+// Preserve host launch parallelism and the existing paired Cube dQ consumers.
 // v96: experimental FP16 dQ Cube, high/low coefficient compensation.
 #define DLI_DQ_CUBE_PASSES 2
 // Kernel侧核函数实现
@@ -712,29 +712,36 @@ private:
 
     __aicore__ inline void OwnerLoadGrad(uint32_t row, bool needQi)
     {
-        // Architecture B: recompute statistics privately at each gradient owner.
-        // No spDI publication/read and no global statistics-completion barrier.
-        // OwnerStats keeps bufDk_ untouched, preserving multirow dK accumulation.
-        OwnerStats(row,false);
-        // No weight GetValue loop: both gradient paths use vector weights.
+        // The second owner barrier publishes dI for every gradient consumer.
+        // Keep bufDk_ untouched: dK owners accumulate across query rows there.
+        dli::SyncVMte2();
+        DataCopy(bufRow_.Get<float>(), spDI_[static_cast<uint64_t>(row) * s2Align_], s2Align_);
+        dli::SyncMte2V();
+        dli::SyncVMte2();
+        LoadWeights(bufOwner_.Get<float>(), static_cast<uint64_t>(row) * nidx1_, nidx1_);
         if (needQi) {
             dli::SyncVMte2();
             LoadTensorF32(bufQi_.Get<float>(), gmQi_,
                           static_cast<uint64_t>(row) * nidx1_ * d_, nidx1_ * d_);
         }
-        if (s2Align_ * 4U <= d_ * sizeof(DT_Q)) {
-            dli::SyncVMte2();
-            DataCopy(bufOutT_.Get<float>(), spR_[static_cast<uint64_t>(row) * nidx1_ * s2Align_],
-                     nidx1_ * s2Align_);
-            dli::SyncMte2V();
-        }
+        // R is loaded by each owner at its own head/key granularity.
     }
 
     __aicore__ inline void OwnerFinishLoss()
     {
-        // One task owns loss. Rows are summed in the original ascending order.
-        float sum=0.0f;
-        for(uint32_t row=0;row<rows_;++row) { sum+=OwnerStats(row,true); }
+        // Read the published slots, retaining ascending-row FP32 summation.
+        LocalTensor<float> slots = bufSmall_.Get<float>();
+        float sum = 0.0f;
+        for (uint32_t first = 0U; first < rows_; first += dli::MAX_STAT) {
+            const uint32_t count = dli::MinU(dli::MAX_STAT, rows_ - first);
+            dli::SyncVMte2();
+            DataCopy(slots, gmDkAcc_[static_cast<uint64_t>(first) * 8U], count * 8U);
+            dli::SyncMte2V();
+            Adds(slots, slots, 0.0f, count * 8U);
+            dli::SyncVS();
+            for (uint32_t i = 0U; i < count; ++i) { sum += slots.GetValue(i * 8U); }
+            dli::SyncSV();
+        }
         WriteLossDirect(sum);
     }
 
@@ -792,19 +799,19 @@ private:
     {
         const bool extraCacheR = (s2Align_ * 4U > d_ * sizeof(DT_Q)) && (s2Align_ <= d_);
         const bool cacheR = (s2Align_ <= d_);
-        OwnerLoadGrad(row, !cacheR);
+        OwnerLoadGrad(row, false);
         const uint32_t hb = g * gradGrp_, he = dli::MinU(nidx1_, hb + gradGrp_);
         LocalTensor<float> qi = bufQi_.Get<float>(), dq = bufDq_.Get<float>();
         LocalTensor<float> kt = bufK_.Get<float>(), prod = bufProd_.Get<float>();
         LocalTensor<float> bb = bufS1b_.Get<float>(), dw = bufS3b_.Get<float>();
         LocalTensor<float> rr = bufOutT_.Get<float>(), di = bufRow_.Get<float>();
-        if (extraCacheR) {
-            // Cached R removes the need for QI in this task. Its existing
-            // H*D-float buffer can hold H*s2Align floats under the guard.
-            rr = qi;
+        if (cacheR) {
+            // Pack only this owner's heads at local offset zero. The existing
+            // capacity guards hold because he-hb never exceeds nidx1_.
+            if (extraCacheR) { rr = qi; }
             dli::SyncVMte2();
-            DataCopy(rr, spR_[static_cast<uint64_t>(row) * nidx1_ * s2Align_],
-                     nidx1_ * s2Align_);
+            DataCopy(rr, spR_[(static_cast<uint64_t>(row) * nidx1_ + hb) * s2Align_],
+                     (he - hb) * s2Align_);
             dli::SyncMte2V();
         }
         LocalTensor<float> ow = bufOwner_.Get<float>();
@@ -835,14 +842,19 @@ private:
                 Duplicate(coeff, 0.0f, nH * 64U);
                 for (uint32_t i = 0U; i < nH; ++i) {
                     if (cacheR) {
-                        Adds(coeff[i * 64U], rr[(h0 + i) * s2Align_ + j], 0.0f, n);
+                        Adds(coeff[i * 64U], rr[(h0 + i - hb) * s2Align_ + j], 0.0f, n);
                     } else {
-                        RowwiseMul(prod, kt, qi[(h0 + i) * d_], n);
-                        FoldReduce(prod, coeff[i * 64U], n);
+                        // Long rows: read only this head's current key tile.
+                        // Published spR_ already contains ReLU(S).
+                        dli::SyncVMte2();
+                        DataCopyExtParams cp{1U, n * 4U, 0U, 0U, 0U};
+                        DataCopyPadExtParams<float> pad{false, 0U, 0U, 0.0f};
+                        DataCopyPad(coeff[i * 64U],
+                            spR_[(static_cast<uint64_t>(row) * nidx1_ + h0 + i) * s2Align_ + j], cp, pad);
+                        dli::SyncMte2V();
                     }
                 }
                 PipeBarrier<PIPE_V>();
-                if (!cacheR) { Relu(coeff, coeff, nH * 64U); PipeBarrier<PIPE_V>(); }
                 // Each repeat is one head; dI is shared across repeats. Reduce
                 // only the n valid keys, not the padded 64-float row.
                 Mul(dwTile, coeff, di[j], static_cast<int32_t>(n), static_cast<uint8_t>(nH), rp);
@@ -911,27 +923,18 @@ private:
         // dK does not produce dQ: reuse that buffer for [H,8] cached R/step.
         // H*8 <= H*D. jb is always an eight-float aligned key offset.
         LocalTensor<float> block = bufDq_.Get<float>();
-        const bool cacheR = (s2Align_ * 4U <= d_ * sizeof(DT_Q));
         Duplicate(dk, 0.0f, (je - jb) * d_);
         for (uint32_t t = 0U; t < s1_; ++t) {
             const uint32_t row = bIdx * s1_ + t;
             OwnerLoadGrad(row, true);
-            if (cacheR) {
-                PipeBarrier<PIPE_V>();
-                DataCopy(block, bufOutT_.Get<float>()[jb],
-                         DataCopyParams{static_cast<uint16_t>(nidx1_), 1U,
-                                        static_cast<uint16_t>(s2Align_ / 8U - 1U), 0U});
-                PipeBarrier<PIPE_V>();
-            } else {
-                // Long R does not fit the whole-row cache. Fetch only this
-                // owner's eight-key block for every head; no KI dot recompute.
-                dli::SyncVMte2();
-                DataCopyExtParams cp{static_cast<uint16_t>(nidx1_), 32U,
-                                     (s2Align_ - 8U) * 4U, 0U, 0U};
-                DataCopyPadExtParams<float> pad{false, 0U, 0U, 0.0f};
-                DataCopyPad(block, spR_[static_cast<uint64_t>(row) * nidx1_ * s2Align_ + jb], cp, pad);
-                dli::SyncMte2V();
-            }
+            // Read this owner's eight-key slice directly from GM for every head.
+            // s2Align_ pads the last key group to a complete 32-byte block.
+            dli::SyncVMte2();
+            DataCopyExtParams cp{static_cast<uint16_t>(nidx1_), 32U,
+                                 (s2Align_ - 8U) * 4U, 0U, 0U};
+            DataCopyPadExtParams<float> pad{false, 0U, 0U, 0.0f};
+            DataCopyPad(block, spR_[static_cast<uint64_t>(row) * nidx1_ * s2Align_ + jb], cp, pad);
+            dli::SyncMte2V();
             // Step once over H*8, not four separate operations for each key.
             Muls(block, block, dli::BIG, nidx1_ * 8U); PipeBarrier<PIPE_V>();
             Mins(block, block, 1.0f, nidx1_ * 8U); PipeBarrier<PIPE_V>();
@@ -997,8 +1000,12 @@ private:
         // all-AIV barrier below then makes that completion global.
         if (cubeR_ && blockIdx_ < 2U) { CrossCoreWaitFlag(8); }
         SyncAll();
-        // Statistics are now local to gradient/loss owners.
-        // The preceding producer barrier still protects spPart and spR.
+        // Exactly one statistics publisher per row, with all AIVs retained.
+        for (uint32_t row = blockIdx_; row < rows_; row += blockNum_) {
+            OwnerPublishStats(row);
+        }
+        SyncAll();
+        // All gradient/loss consumers now read the published dI/loss slots.
         if (cubeDq_) {
             // Only AIV0 publishes dS. Mode 2 AIC wait requires both paired
             // AIV notifications, so AIV1 may arrive early without a global barrier.
@@ -1009,7 +1016,7 @@ private:
                 // The paired AIVs alone consume Cube output; no global handoff.
                 for (uint32_t g=blockIdx_;g<nGradGrp_;g+=2U) { OwnerDq(0U,g); }
             }
-            // dK and loss derive local statistics from published R/partials,
+            // dK and loss consume shared statistics published before the barrier,
             // independently of the Cube dQ result workspace.
             // Other AIVs perform them while AIC0 and its paired AIVs run dQ.
             const uint32_t keyGroups=dli::CeilDiv(s2_,8U);
